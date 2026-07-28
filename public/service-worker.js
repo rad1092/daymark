@@ -1,4 +1,6 @@
-const CACHE_VERSION = "daymark-v1";
+const CACHE_PREFIX = "daymark-shell-";
+const RELEASE_ID = "__DAYMARK_RELEASE__";
+const CACHE_VERSION = `${CACHE_PREFIX}${RELEASE_ID}`;
 const scopeUrl = new URL(self.registration.scope);
 const basePath = scopeUrl.pathname.endsWith("/")
   ? scopeUrl.pathname
@@ -27,7 +29,7 @@ self.addEventListener("activate", (event) => {
       .then((keys) =>
         Promise.all(
           keys
-            .filter((key) => key.startsWith("daymark-") && key !== CACHE_VERSION)
+            .filter((key) => key.startsWith(CACHE_PREFIX) && key !== CACHE_VERSION)
             .map((key) => caches.delete(key)),
         ),
       )

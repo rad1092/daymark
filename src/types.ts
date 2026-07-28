@@ -1,23 +1,62 @@
-export type ViewName = "today" | "inbox" | "week" | "log";
-export type TaskStatus = "inbox" | "today" | "done";
-export type FocusMode = "running" | "paused";
+export type TaskStatus =
+  | "inbox"
+  | "planned"
+  | "later"
+  | "blocked"
+  | "done"
+  | "deleted";
+
+export type PlanStatus = "draft" | "active" | "closing" | "closed";
+
+export type PlanOutcome =
+  | "pending"
+  | "done"
+  | "later"
+  | "tomorrow"
+  | "blocked"
+  | "deleted"
+  | "carried";
+
+export type TaskAction =
+  | "done"
+  | "later"
+  | "tomorrow"
+  | "blocked"
+  | "deleted";
 
 export interface DaymarkTask {
   id: string;
   title: string;
   notes: string;
-  tags: string[];
   status: TaskStatus;
+  estimateMinutes: number | null;
   createdAt: string;
   completedAt: string | null;
-  scheduledDate: string | null;
-  scheduledTime: string | null;
-  durationMinutes: number;
-  isTop3: boolean;
-  top3Rank: number | null;
+  blockedReason: string | null;
+  reviewOn: string | null;
+  legacy: {
+    tags: string[];
+    scheduledTime: string | null;
+  } | null;
 }
 
-export interface FocusRecord {
+export interface PlanItem {
+  taskId: string;
+  addedAt: string;
+  outcome: PlanOutcome;
+  resolvedAt: string | null;
+}
+
+export interface DailyPlan {
+  date: string;
+  status: PlanStatus;
+  items: PlanItem[];
+  currentTaskId: string | null;
+  startedAt: string | null;
+  closedAt: string | null;
+}
+
+export interface LegacyFocusRecord {
   id: string;
   taskId: string | null;
   taskTitle: string;
@@ -26,43 +65,30 @@ export interface FocusRecord {
   minutes: number;
 }
 
-export interface ActiveFocus {
-  taskId: string | null;
-  taskTitle: string;
-  durationMinutes: number;
-  startedAt: string;
-  mode: FocusMode;
-  endAt: string | null;
-  remainingSeconds: number;
-}
-
-export interface DaymarkPreferences {
-  defaultFocusMinutes: number;
-  lastView: ViewName;
-  hasSeenWelcome: boolean;
-}
-
 export interface DaymarkData {
-  schemaVersion: 1;
+  schemaVersion: 2;
   tasks: DaymarkTask[];
-  focusRecords: FocusRecord[];
-  activeFocus: ActiveFocus | null;
-  preferences: DaymarkPreferences;
+  plans: DailyPlan[];
+  archive: {
+    legacyFocusRecords: LegacyFocusRecord[];
+  };
   updatedAt: string;
 }
 
-export interface WeeklyDay {
-  date: string;
-  label: string;
-  completed: number;
-  focusMinutes: number;
+export interface ReviewItem {
+  taskId: string;
+  source: "stale-plan" | "scheduled";
+  planDate: string | null;
 }
 
-export interface WeeklySummary {
-  completed: number;
-  focusMinutes: number;
-  activeDays: number;
-  completionRate: number;
-  topTag: string | null;
-  days: WeeklyDay[];
+export interface BlockedDetails {
+  reason: string;
+  reviewOn: string;
+}
+
+export interface StorageLoadResult {
+  data: DaymarkData | null;
+  recovered: boolean;
+  migrated: boolean;
+  issue: string | null;
 }

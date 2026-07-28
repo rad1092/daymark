@@ -1,15 +1,15 @@
 {
   "id": "/daymark/",
-  "name": "Daymark — 오늘을 실행하는 플래너",
+  "name": "Daymark — 오늘의 약속 세 가지",
   "short_name": "Daymark",
-  "description": "수집부터 집중, 회고까지 한 기기에서 이어지는 local-first 일일 실행 플래너.",
+  "description": "오늘의 약속을 세 가지까지 정하고 남은 일을 다음 방문에서 다시 결정하는 일일 실행 플래너.",
   "lang": "ko-KR",
   "start_url": "/daymark/",
   "scope": "/daymark/",
   "display": "standalone",
   "orientation": "any",
-  "background_color": "#f2eee4",
-  "theme_color": "#1d3a31",
+  "background_color": "#f4f2ed",
+  "theme_color": "#1d1d1b",
   "categories": ["productivity", "utilities"],
   "icons": [
     {
