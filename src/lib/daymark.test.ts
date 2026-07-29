@@ -1,26 +1,40 @@
 import { describe, expect, it } from "vitest";
 import {
   BACKUP_KEY,
+  CORRUPT_HISTORY_KEY,
+  CORRUPT_PRIMARY_KEY,
   LEGACY_STORAGE_KEY,
+  SNAPSHOTS_KEY,
   STORAGE_KEY,
+  V2_STORAGE_KEY,
   actOnPlannedTask,
+  adoptImportedData,
   addCapturedTask,
   addTaskToToday,
   beginDayClose,
   closeDay,
+  confirmBackupRecovery,
   createEmptyData,
   getCommittedCount,
   getCleanupCandidates,
   getPlan,
   getRecentDaySummaries,
+  getRecentReceipts,
   getReviewItems,
   getTask,
+  loadSnapshots,
   loadStoredData,
   migrateLegacyData,
   parseBackupData,
   parseDaymarkData,
   pruneSettledTasks,
+  removeTaskFromToday,
+  replaceUnreadableStoredData,
+  reorderPendingTask,
+  reopenDay,
   resolveReviewItem,
+  restoreSnapshotData,
+  saveSnapshot,
   saveStoredData,
   searchTaskHistory,
   startPlan,
@@ -78,7 +92,8 @@ function legacyTask(
 describe("first run and capture", () => {
   it("starts with a truly empty state", () => {
     const data = createEmptyData(NOW);
-    expect(data.schemaVersion).toBe(2);
+    expect(data.schemaVersion).toBe(3);
+    expect(data.revision).toBe(0);
     expect(data.tasks).toEqual([]);
     expect(data.plans).toEqual([]);
   });
@@ -133,7 +148,7 @@ describe("three promises and one current task", () => {
     expect(getTask(data, firstId)?.status).toBe("done");
   });
 
-  it("lets a moved promise free its slot without erasing the decision history", () => {
+  it("lets a draft promise be removed and replaced before starting", () => {
     let data = createEmptyData(NOW);
     const ids: string[] = [];
     for (const title of ["하나", "둘", "셋", "교체"]) {
@@ -143,19 +158,54 @@ describe("three promises and one current task", () => {
     for (const id of ids.slice(0, 3)) {
       data = addTaskToToday(data, id, TODAY, NOW);
     }
-    data = actOnPlannedTask(
-      data,
-      TODAY,
-      ids[0],
-      "later",
-      TODAY,
-      NOW,
-    );
+    data = removeTaskFromToday(data, ids[0], TODAY, NOW);
     data = addTaskToToday(data, ids[3], TODAY, NOW);
 
-    expect(getPlan(data, TODAY)?.items).toHaveLength(4);
+    expect(getPlan(data, TODAY)?.items).toHaveLength(3);
+    expect(getTask(data, ids[0])?.status).toBe("inbox");
     expect(getCommittedCount(getPlan(data, TODAY))).toBe(3);
     expect(() => parseDaymarkData(JSON.stringify(data))).not.toThrow();
+  });
+
+  it("locks the original commitment count after starting, even after a defer", () => {
+    let data = createEmptyData(NOW);
+    const ids: string[] = [];
+    for (const title of ["하나", "둘", "셋", "넷"]) {
+      data = addCapturedTask(data, title, NOW);
+      ids.push(data.tasks[0].id);
+    }
+    for (const id of ids.slice(0, 3)) {
+      data = addTaskToToday(data, id, TODAY, NOW);
+    }
+    data = startPlan(data, TODAY, NOW);
+    data = actOnPlannedTask(data, TODAY, ids[0], "tomorrow", TODAY, NOW, {
+      reviewOn: TOMORROW,
+      nextStep: "첫 문단부터 다시 읽기",
+    });
+
+    expect(getPlan(data, TODAY)?.initialCommitmentIds).toEqual(ids.slice(0, 3));
+    expect(() => addTaskToToday(data, ids[3], TODAY, NOW)).toThrow(
+      "약속을 늘릴 수 없습니다",
+    );
+  });
+
+  it("reorders the draft before locking the execution order", () => {
+    let data = createEmptyData(NOW);
+    data = addCapturedTask(data, "첫째", NOW);
+    const firstId = data.tasks[0].id;
+    data = addCapturedTask(data, "둘째", NOW);
+    const secondId = data.tasks[0].id;
+    data = addTaskToToday(data, firstId, TODAY, NOW);
+    data = addTaskToToday(data, secondId, TODAY, NOW);
+
+    data = reorderPendingTask(data, secondId, -1, TODAY, NOW);
+    data = startPlan(data, TODAY, NOW);
+
+    expect(getPlan(data, TODAY)?.initialCommitmentIds).toEqual([
+      secondId,
+      firstId,
+    ]);
+    expect(getPlan(data, TODAY)?.currentTaskId).toBe(secondId);
   });
 });
 
@@ -189,10 +239,14 @@ describe("date boundary review", () => {
   it("carries a reviewed item only after an explicit today decision", () => {
     const first = captured("다시 정할 일");
     let data = addTaskToToday(first.data, first.task.id, YESTERDAY, NOW);
+    data = startPlan(data, YESTERDAY, NOW);
     const item = getReviewItems(data, TODAY)[0];
     data = resolveReviewItem(data, item, "today", TODAY, NOW);
 
     expect(getPlan(data, YESTERDAY)?.status).toBe("closed");
+    expect(getPlan(data, YESTERDAY)?.receipt?.items[0].outcome).toBe(
+      "carried",
+    );
     expect(getPlan(data, TODAY)?.items[0].taskId).toBe(first.task.id);
     expect(getPlan(data, TODAY)?.items[0].outcome).toBe("pending");
   });
@@ -200,11 +254,22 @@ describe("date boundary review", () => {
   it("returns a tomorrow decision to review on the next day", () => {
     const first = captured("내일 결정할 일");
     let data = addTaskToToday(first.data, first.task.id, YESTERDAY, NOW);
+    data = startPlan(data, YESTERDAY, NOW);
     const item = getReviewItems(data, TODAY)[0];
-    data = resolveReviewItem(data, item, "tomorrow", TODAY, NOW);
+    data = resolveReviewItem(data, item, "tomorrow", TODAY, NOW, {
+      reviewOn: TOMORROW,
+      nextStep: "첫 항목부터 확인",
+    });
 
     expect(getReviewItems(data, TODAY)).toEqual([]);
-    expect(getTask(data, first.task.id)?.reviewOn).toBe(TOMORROW);
+    expect(getTask(data, first.task.id)).toMatchObject({
+      reviewOn: TOMORROW,
+      nextStep: "첫 항목부터 확인",
+    });
+    expect(getPlan(data, YESTERDAY)?.receipt?.items[0]).toMatchObject({
+      outcome: "tomorrow",
+      nextStep: "첫 항목부터 확인",
+    });
     expect(getReviewItems(data, TOMORROW)[0]?.taskId).toBe(first.task.id);
   });
 
@@ -215,6 +280,7 @@ describe("date boundary review", () => {
     data = resolveReviewItem(data, item, "blocked", TODAY, NOW, {
       reason: "외부 회신 대기",
       reviewOn: "2026-07-31",
+      nextStep: "회신 금액 확인",
     });
 
     expect(getReviewItems(data, TOMORROW)).toEqual([]);
@@ -253,9 +319,16 @@ describe("day closing", () => {
 
     expect(getPlan(data, TODAY)?.status).toBe("closed");
     expect(getPlan(data, TODAY)?.closedAt).toBe(NOW.toISOString());
+    expect(getRecentReceipts(data)[0]?.items).toEqual([
+      expect.objectContaining({
+        taskId: first.task.id,
+        title: "끝낸 일",
+        outcome: "done",
+      }),
+    ]);
   });
 
-  it("requires a reason and future date for blocked work", () => {
+  it("requires a reason, future date, and next action for blocked work", () => {
     const first = captured("회신 대기");
     let data = addTaskToToday(first.data, first.task.id, TODAY, NOW);
     expect(() =>
@@ -266,7 +339,7 @@ describe("day closing", () => {
         "blocked",
         TODAY,
         NOW,
-        { reason: "", reviewOn: TOMORROW },
+        { reason: "", reviewOn: TOMORROW, nextStep: "회신 확인" },
       ),
     ).toThrow("막힌 이유");
 
@@ -277,13 +350,65 @@ describe("day closing", () => {
       "blocked",
       TODAY,
       NOW,
-      { reason: "견적 회신 대기", reviewOn: TOMORROW },
+      {
+        reason: "견적 회신 대기",
+        reviewOn: TOMORROW,
+        nextStep: "회신 금액 확인",
+      },
     );
     expect(getTask(data, first.task.id)).toMatchObject({
       status: "blocked",
       blockedReason: "견적 회신 대기",
       reviewOn: TOMORROW,
+      nextStep: "회신 금액 확인",
     });
+  });
+
+  it("reopens a closed day with the same commitments", () => {
+    const first = captured("다시 열 일");
+    let data = addTaskToToday(first.data, first.task.id, TODAY, NOW);
+    data = startPlan(data, TODAY, NOW);
+    data = actOnPlannedTask(data, TODAY, first.task.id, "done", TODAY, NOW);
+    data = beginDayClose(data, TODAY, NOW);
+    data = closeDay(data, TODAY, NOW);
+    data = reopenDay(data, TODAY, NOW);
+
+    expect(getPlan(data, TODAY)).toMatchObject({
+      status: "active",
+      currentTaskId: first.task.id,
+      receipt: null,
+    });
+    expect(getPlan(data, TODAY)?.items[0].outcome).toBe("pending");
+    expect(getTask(data, first.task.id)?.status).toBe("planned");
+  });
+
+  it("records all three results and the restart clues at close", () => {
+    let data = createEmptyData(NOW);
+    const ids: string[] = [];
+    for (const title of ["완료할 일", "내일 할 일", "막힌 일"]) {
+      data = addCapturedTask(data, title, NOW);
+      ids.push(data.tasks[0].id);
+    }
+    for (const id of ids) data = addTaskToToday(data, id, TODAY, NOW);
+    data = startPlan(data, TODAY, NOW);
+    data = actOnPlannedTask(data, TODAY, ids[0], "done", TODAY, NOW);
+    data = actOnPlannedTask(data, TODAY, ids[1], "tomorrow", TODAY, NOW, {
+      reviewOn: TOMORROW,
+      nextStep: "배포 로그 열기",
+    });
+    data = actOnPlannedTask(data, TODAY, ids[2], "blocked", TODAY, NOW, {
+      reason: "회신 대기",
+      reviewOn: TOMORROW,
+      nextStep: "회신 금액 확인",
+    });
+    data = beginDayClose(data, TODAY, NOW);
+    data = closeDay(data, TODAY, NOW);
+
+    expect(getPlan(data, TODAY)?.receipt?.items).toMatchObject([
+      { outcome: "done", nextStep: "" },
+      { outcome: "tomorrow", nextStep: "배포 로그 열기" },
+      { outcome: "blocked", nextStep: "회신 금액 확인" },
+    ]);
   });
 });
 
@@ -299,6 +424,10 @@ describe("records and cleanup", () => {
       data = addTaskToToday(data, taskId, YESTERDAY, NOW);
     }
     for (const [index, action] of actions.entries()) {
+      const details =
+        action === "done"
+          ? undefined
+          : { reviewOn: TOMORROW, nextStep: `다음 행동 ${index}` };
       data = actOnPlannedTask(
         data,
         YESTERDAY,
@@ -306,6 +435,7 @@ describe("records and cleanup", () => {
         action,
         TODAY,
         NOW,
+        details,
       );
     }
 
@@ -342,6 +472,7 @@ describe("records and cleanup", () => {
     let data = addCapturedTask(createEmptyData(oldNow), "오래된 완료", oldNow);
     const oldId = data.tasks[0].id;
     data = addTaskToToday(data, oldId, "2026-06-01", oldNow);
+    data = startPlan(data, "2026-06-01", oldNow);
     data = actOnPlannedTask(
       data,
       "2026-06-01",
@@ -350,6 +481,8 @@ describe("records and cleanup", () => {
       "2026-06-01",
       oldNow,
     );
+    data = beginDayClose(data, "2026-06-01", oldNow);
+    data = closeDay(data, "2026-06-01", oldNow);
     data = addCapturedTask(data, "최근 완료", NOW);
     const recentId = data.tasks[0].id;
     data = addTaskToToday(data, recentId, TODAY, NOW);
@@ -421,7 +554,7 @@ describe("v1 migration", () => {
     });
   });
 
-  it("loads v1 into v2 without writing over the legacy key", () => {
+  it("loads v1 into v3 without writing over the legacy key", () => {
     const storage = new MemoryStorage();
     const raw = JSON.stringify({
       schemaVersion: 1,
@@ -432,12 +565,12 @@ describe("v1 migration", () => {
 
     const result = loadStoredData(storage, TODAY, NOW);
     expect(result.migrated).toBe(true);
-    expect(result.data?.schemaVersion).toBe(2);
+    expect(result.data?.schemaVersion).toBe(3);
     expect(storage.getItem(LEGACY_STORAGE_KEY)).toBe(raw);
     expect(storage.getItem(STORAGE_KEY)).toBeNull();
   });
 
-  it("accepts both v1 and v2 JSON backups", () => {
+  it("accepts v1 and current JSON backups", () => {
     const v1 = JSON.stringify({
       schemaVersion: 1,
       tasks: [legacyTask("1")],
@@ -445,16 +578,108 @@ describe("v1 migration", () => {
     });
     expect(parseBackupData(v1, TODAY, NOW).migrated).toBe(true);
 
-    const v2 = createEmptyData(NOW);
-    expect(parseBackupData(JSON.stringify(v2), TODAY, NOW)).toEqual({
-      data: v2,
+    const current = createEmptyData(NOW);
+    expect(parseBackupData(JSON.stringify(current), TODAY, NOW)).toEqual({
+      data: current,
       migrated: false,
     });
   });
 });
 
+describe("v2 migration", () => {
+  it("puts dateless later work into today's review", () => {
+    const raw = JSON.stringify({
+      schemaVersion: 2,
+      tasks: [
+        {
+          id: "later-1",
+          title: "날짜 없던 일",
+          notes: "",
+          status: "later",
+          estimateMinutes: null,
+          createdAt: NOW.toISOString(),
+          completedAt: null,
+          settledAt: null,
+          blockedReason: null,
+          reviewOn: null,
+          legacy: null,
+        },
+      ],
+      plans: [],
+      archive: { legacyFocusRecords: [] },
+      updatedAt: NOW.toISOString(),
+    });
+    const storage = new MemoryStorage();
+    storage.setItem(V2_STORAGE_KEY, raw);
+
+    const result = loadStoredData(storage, TODAY, NOW);
+
+    expect(result.migrated).toBe(true);
+    expect(result.data?.schemaVersion).toBe(3);
+    expect(getTask(result.data!, "later-1")).toMatchObject({
+      reviewOn: TODAY,
+      nextStep: "",
+    });
+    expect(getReviewItems(result.data!, TODAY)[0]?.taskId).toBe("later-1");
+    expect(storage.getItem(V2_STORAGE_KEY)).toBe(raw);
+  });
+
+  it("keeps a migrated draft editable and reloadable", () => {
+    const ids = ["draft-1", "draft-2", "draft-3"];
+    const raw = JSON.stringify({
+      schemaVersion: 2,
+      tasks: ids.map((id) => ({
+        id,
+        title: id,
+        notes: "",
+        status: "planned",
+        estimateMinutes: null,
+        createdAt: NOW.toISOString(),
+        completedAt: null,
+        settledAt: null,
+        blockedReason: null,
+        reviewOn: null,
+        legacy: null,
+      })),
+      plans: [
+        {
+          date: TODAY,
+          status: "draft",
+          items: ids.map((taskId) => ({
+            taskId,
+            addedAt: NOW.toISOString(),
+            outcome: "pending",
+            resolvedAt: null,
+          })),
+          currentTaskId: null,
+          startedAt: null,
+          closedAt: null,
+        },
+      ],
+      archive: { legacyFocusRecords: [] },
+      updatedAt: NOW.toISOString(),
+    });
+    let data = parseBackupData(raw, TODAY, NOW).data;
+
+    expect(getPlan(data, TODAY)?.initialCommitmentIds).toEqual([]);
+    data = reorderPendingTask(data, ids[1], -1, TODAY, NOW);
+    data = removeTaskFromToday(data, ids[0], TODAY, NOW);
+
+    const storage = new MemoryStorage();
+    saveStoredData(storage, data);
+    const reloaded = loadStoredData(storage, TODAY, NOW).data;
+
+    expect(reloaded).not.toBeNull();
+    expect(getPlan(reloaded!, TODAY)?.initialCommitmentIds).toEqual([]);
+    expect(getPlan(reloaded!, TODAY)?.items.map((item) => item.taskId)).toEqual([
+      ids[1],
+      ids[2],
+    ]);
+  });
+});
+
 describe("reload and recovery", () => {
-  it("round-trips the complete v2 state through storage", () => {
+  it("round-trips the complete v3 state through storage", () => {
     const storage = new MemoryStorage();
     const first = captured("새로고침 뒤에도 남을 일");
     const data = addTaskToToday(first.data, first.task.id, TODAY, NOW);
@@ -476,10 +701,36 @@ describe("reload and recovery", () => {
 
     const result = loadStoredData(storage, TODAY, NOW);
     expect(result.recovered).toBe(true);
+    expect(result.needsRecovery).toBe(true);
     expect(result.data).toEqual(first);
+
+    expect(() =>
+      saveStoredData(storage, result.data!, result.data!),
+    ).toThrow();
+    confirmBackupRecovery(storage, result.data!);
+
+    expect(storage.getItem(CORRUPT_PRIMARY_KEY)).toBe("{broken");
+    expect(parseDaymarkData(storage.getItem(STORAGE_KEY)!)).toEqual(first);
+    expect(loadStoredData(storage, TODAY, NOW).needsRecovery).toBe(false);
+    const changed = addCapturedTask(first, "복구 뒤 변경", NOW);
+    expect(() =>
+      saveStoredData(storage, changed, first),
+    ).not.toThrow();
   });
 
-  it("does not replace corrupt v2 data with an older v1 copy", () => {
+  it("does not use the recovery bypass over a valid primary", () => {
+    const storage = new MemoryStorage();
+    const data = createEmptyData(NOW);
+    saveStoredData(storage, data);
+    storage.setItem(BACKUP_KEY, JSON.stringify(data));
+
+    expect(() => confirmBackupRecovery(storage, data)).toThrow(
+      "현재 저장 데이터가 정상",
+    );
+    expect(storage.getItem(CORRUPT_PRIMARY_KEY)).toBeNull();
+  });
+
+  it("does not replace corrupt v3 data with an older v1 copy", () => {
     const storage = new MemoryStorage();
     storage.setItem(STORAGE_KEY, "{broken");
     storage.setItem(
@@ -496,5 +747,159 @@ describe("reload and recovery", () => {
     expect(result.migrated).toBe(false);
     expect(result.issue).toContain("자동 저장을 중지했습니다");
     expect(storage.getItem(STORAGE_KEY)).toBe("{broken");
+  });
+
+  it("rejects a save made from a stale revision", () => {
+    const storage = new MemoryStorage();
+    const first = createEmptyData(NOW);
+    saveStoredData(storage, first);
+    const second = addCapturedTask(first, "다른 탭 변경", NOW);
+    saveStoredData(storage, second, first);
+
+    expect(() =>
+      saveStoredData(
+        storage,
+        addCapturedTask(first, "현재 탭 변경", NOW),
+        first,
+      ),
+    ).toThrow("다른 탭");
+  });
+
+  it("rejects a divergent save even when the revision is the same", () => {
+    const storage = new MemoryStorage();
+    const base = createEmptyData(NOW);
+    saveStoredData(storage, base);
+    const external = {
+      ...addCapturedTask(base, "다른 탭 변경", NOW),
+      revision: base.revision,
+    };
+    storage.setItem(STORAGE_KEY, JSON.stringify(external));
+
+    expect(() =>
+      saveStoredData(
+        storage,
+        addCapturedTask(base, "현재 탭 변경", NOW),
+        base,
+      ),
+    ).toThrow("다른 탭");
+    expect(parseDaymarkData(storage.getItem(STORAGE_KEY)!)).toEqual(
+      external,
+    );
+  });
+
+  it("preserves each corrupt primary across repeated recovery", () => {
+    const storage = new MemoryStorage();
+    const first = createEmptyData(NOW);
+    saveStoredData(storage, first);
+    const second = addCapturedTask(first, "두 번째 상태", NOW);
+    saveStoredData(storage, second, first);
+
+    storage.setItem(STORAGE_KEY, "{broken-first");
+    const firstRecovery = loadStoredData(storage, TODAY, NOW);
+    confirmBackupRecovery(storage, firstRecovery.data!, NOW);
+
+    const third = addCapturedTask(firstRecovery.data!, "복구 뒤 변경", NOW);
+    saveStoredData(storage, third, firstRecovery.data!);
+    const fourth = addCapturedTask(third, "백업 회전", NOW);
+    saveStoredData(storage, fourth, third);
+    storage.setItem(STORAGE_KEY, "{broken-second");
+    const secondRecovery = loadStoredData(storage, TODAY, NOW);
+    confirmBackupRecovery(storage, secondRecovery.data!, NOW);
+
+    expect(storage.getItem(CORRUPT_PRIMARY_KEY)).toBe("{broken-second");
+    expect(
+      JSON.parse(storage.getItem(CORRUPT_HISTORY_KEY) ?? "[]"),
+    ).toEqual([
+      expect.objectContaining({
+        source: "primary",
+        raw: "{broken-first",
+      }),
+    ]);
+  });
+
+  it("keeps only the five most recent prior corrupt primaries", () => {
+    const storage = new MemoryStorage();
+    const backup = createEmptyData(NOW);
+    storage.setItem(BACKUP_KEY, JSON.stringify(backup));
+
+    for (let index = 1; index <= 7; index += 1) {
+      storage.setItem(STORAGE_KEY, `{broken-${index}`);
+      const recovery = loadStoredData(storage, TODAY, NOW);
+      confirmBackupRecovery(storage, recovery.data!, NOW);
+    }
+
+    expect(storage.getItem(CORRUPT_PRIMARY_KEY)).toBe("{broken-7");
+    const history = JSON.parse(
+      storage.getItem(CORRUPT_HISTORY_KEY) ?? "[]",
+    );
+    expect(history).toHaveLength(5);
+    expect(
+      history.map((record: { raw: string }) => record.raw),
+    ).toEqual([
+      "{broken-2",
+      "{broken-3",
+      "{broken-4",
+      "{broken-5",
+      "{broken-6",
+    ]);
+  });
+
+  it("explicitly replaces unreadable storage while preserving raw inputs", () => {
+    const storage = new MemoryStorage();
+    storage.setItem(STORAGE_KEY, "{broken-primary");
+    storage.setItem(BACKUP_KEY, "{broken-backup");
+    const replacement = addCapturedTask(
+      createEmptyData(NOW),
+      "가져온 백업",
+      NOW,
+    );
+
+    replaceUnreadableStoredData(storage, replacement, NOW);
+
+    expect(parseDaymarkData(storage.getItem(STORAGE_KEY)!)).toEqual(
+      replacement,
+    );
+    expect(storage.getItem(CORRUPT_PRIMARY_KEY)).toBe("{broken-primary");
+    expect(
+      JSON.parse(storage.getItem(CORRUPT_HISTORY_KEY) ?? "[]"),
+    ).toEqual([
+      expect.objectContaining({
+        source: "backup",
+        raw: "{broken-backup",
+      }),
+    ]);
+    expect(() =>
+      replaceUnreadableStoredData(storage, createEmptyData(NOW), NOW),
+    ).toThrow("현재 저장 데이터가 정상");
+  });
+
+  it("stores timestamped snapshots and restores them as a new revision", () => {
+    const storage = new MemoryStorage();
+    const first = captured("복구할 일").data;
+    const snapshots = saveSnapshot(
+      storage,
+      first,
+      "완료 전",
+      new Date("2026-07-28T10:00:00+09:00"),
+    );
+    const changed = addCapturedTask(first, "두 번째 일", NOW);
+    const restored = restoreSnapshotData(changed, snapshots[0], NOW);
+
+    expect(storage.getItem(SNAPSHOTS_KEY)).not.toBeNull();
+    expect(loadSnapshots(storage)[0]).toMatchObject({
+      label: "완료 전",
+      createdAt: "2026-07-28T01:00:00.000Z",
+    });
+    expect(restored.tasks).toHaveLength(1);
+    expect(restored.revision).toBe(changed.revision + 1);
+  });
+
+  it("adopts an imported backup without going backwards in revision", () => {
+    const current = addCapturedTask(createEmptyData(NOW), "현재", NOW);
+    const imported = createEmptyData(NOW);
+    const adopted = adoptImportedData(current, imported, NOW);
+
+    expect(adopted.tasks).toEqual([]);
+    expect(adopted.revision).toBe(current.revision + 1);
   });
 });
