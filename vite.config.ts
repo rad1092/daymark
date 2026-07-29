@@ -39,7 +39,7 @@ function stampServiceWorker(): Plugin {
 }
 
 export default defineConfig({
-  base: "/daymark/",
+  base: "/",
   plugins: [react(), stampServiceWorker()],
   test: {
     environment: "jsdom",

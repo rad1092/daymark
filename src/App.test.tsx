@@ -65,4 +65,20 @@ describe("Daymark 첫 사용 흐름", () => {
       screen.getByRole("heading", { name: "내일 확인할 메모" }),
     ).toBeVisible();
   });
+
+  it("오늘과 기록 화면을 제품 안에서 오간다", () => {
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "기록 화면" }));
+    expect(screen.getByRole("heading", { name: "기록" })).toBeVisible();
+    expect(
+      screen.getByRole("table", { name: /하루 결정/i }),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("searchbox", { name: "제목·메모·막힌 이유 검색" }),
+    ).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: "오늘 화면" }));
+    expect(screen.getByRole("heading", { name: "오늘 할 일" })).toBeVisible();
+  });
 });

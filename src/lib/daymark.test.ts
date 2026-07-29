@@ -10,16 +10,21 @@ import {
   closeDay,
   createEmptyData,
   getCommittedCount,
+  getCleanupCandidates,
   getPlan,
+  getRecentDaySummaries,
   getReviewItems,
   getTask,
   loadStoredData,
   migrateLegacyData,
   parseBackupData,
   parseDaymarkData,
+  pruneSettledTasks,
   resolveReviewItem,
   saveStoredData,
+  searchTaskHistory,
   startPlan,
+  updateTask,
 } from "./daymark";
 
 class MemoryStorage {
@@ -279,6 +284,85 @@ describe("day closing", () => {
       blockedReason: "견적 회신 대기",
       reviewOn: TOMORROW,
     });
+  });
+});
+
+describe("records and cleanup", () => {
+  it("summarizes the five explicit daily outcomes over seven dates", () => {
+    let data = createEmptyData(NOW);
+    const actions = ["done", "tomorrow", "later"] as const;
+    const taskIds: string[] = [];
+    for (const [index] of actions.entries()) {
+      data = addCapturedTask(data, `결정 ${index}`, NOW);
+      const taskId = data.tasks[0].id;
+      taskIds.push(taskId);
+      data = addTaskToToday(data, taskId, YESTERDAY, NOW);
+    }
+    for (const [index, action] of actions.entries()) {
+      data = actOnPlannedTask(
+        data,
+        YESTERDAY,
+        taskIds[index],
+        action,
+        TODAY,
+        NOW,
+      );
+    }
+
+    const summary = getRecentDaySummaries(data, TODAY).find(
+      (item) => item.date === YESTERDAY,
+    );
+    expect(summary?.counts).toEqual({
+      done: 1,
+      tomorrow: 1,
+      later: 1,
+      blocked: 0,
+      deleted: 0,
+    });
+  });
+
+  it("searches resolved work by title and notes", () => {
+    let data = addCapturedTask(createEmptyData(NOW), "견적서 검토", NOW);
+    const taskId = data.tasks[0].id;
+    data = updateTask(data, taskId, { notes: "거래처 회신 확인" }, NOW);
+    data = addTaskToToday(data, taskId, TODAY, NOW);
+    data = actOnPlannedTask(data, TODAY, taskId, "done", TODAY, NOW);
+
+    expect(searchTaskHistory(data, "회신")).toMatchObject([
+      {
+        task: { id: taskId, title: "견적서 검토" },
+        outcome: "done",
+      },
+    ]);
+    expect(searchTaskHistory(data, "없는 일")).toEqual([]);
+  });
+
+  it("removes only settled work older than the cutoff and its plan links", () => {
+    const oldNow = new Date("2026-06-01T09:00:00+09:00");
+    let data = addCapturedTask(createEmptyData(oldNow), "오래된 완료", oldNow);
+    const oldId = data.tasks[0].id;
+    data = addTaskToToday(data, oldId, "2026-06-01", oldNow);
+    data = actOnPlannedTask(
+      data,
+      "2026-06-01",
+      oldId,
+      "done",
+      "2026-06-01",
+      oldNow,
+    );
+    data = addCapturedTask(data, "최근 완료", NOW);
+    const recentId = data.tasks[0].id;
+    data = addTaskToToday(data, recentId, TODAY, NOW);
+    data = actOnPlannedTask(data, TODAY, recentId, "done", TODAY, NOW);
+
+    expect(getCleanupCandidates(data, "2026-06-29").map((task) => task.id)).toEqual([
+      oldId,
+    ]);
+    const pruned = pruneSettledTasks(data, "2026-06-29", NOW);
+    expect(getTask(pruned, oldId)).toBeUndefined();
+    expect(getPlan(pruned, "2026-06-01")).toBeUndefined();
+    expect(getTask(pruned, recentId)).toBeDefined();
+    expect(() => parseDaymarkData(JSON.stringify(pruned))).not.toThrow();
   });
 });
 

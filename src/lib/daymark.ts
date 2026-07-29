@@ -1,5 +1,7 @@
 import type {
   BlockedDetails,
+  DaySummary,
+  DaySummaryOutcome,
   DailyPlan,
   DaymarkData,
   DaymarkTask,
@@ -9,6 +11,7 @@ import type {
   ReviewItem,
   StorageLoadResult,
   TaskAction,
+  TaskHistoryEntry,
   TaskStatus,
 } from "../types";
 
@@ -133,6 +136,7 @@ export function createTask(
     estimateMinutes: null,
     createdAt: now.toISOString(),
     completedAt: null,
+    settledAt: null,
     blockedReason: null,
     reviewOn: null,
     legacy: null,
@@ -181,6 +185,7 @@ function isTask(value: unknown): value is DaymarkTask {
         value.estimateMinutes <= 720)) &&
     typeof value.createdAt === "string" &&
     isNullableString(value.completedAt) &&
+    (value.settledAt === undefined || isNullableString(value.settledAt)) &&
     isNullableString(value.blockedReason) &&
     isNullableString(value.reviewOn) &&
     (value.reviewOn === null || DATE_PATTERN.test(value.reviewOn)) &&
@@ -302,7 +307,28 @@ export function parseDaymarkData(raw: string): DaymarkData {
       throw new Error("현재 작업이 미처리 약속과 일치하지 않습니다.");
     }
   }
-  return data;
+  const resolvedByTask = new Map<string, string>();
+  for (const plan of data.plans) {
+    for (const item of plan.items) {
+      if (!item.resolvedAt) continue;
+      const current = resolvedByTask.get(item.taskId);
+      if (!current || item.resolvedAt > current) {
+        resolvedByTask.set(item.taskId, item.resolvedAt);
+      }
+    }
+  }
+  return {
+    ...data,
+    tasks: data.tasks.map((task) => ({
+      ...task,
+      settledAt:
+        task.settledAt ??
+        task.completedAt ??
+        (task.status === "deleted"
+          ? resolvedByTask.get(task.id) ?? data.updatedAt
+          : null),
+    })),
+  };
 }
 
 export function parseBackupData(
@@ -417,6 +443,7 @@ export function migrateLegacyData(
           : null,
       createdAt: task.createdAt,
       completedAt: task.completedAt,
+      settledAt: task.completedAt,
       blockedReason: null,
       reviewOn,
       legacy: {
@@ -627,6 +654,138 @@ export function getCommittedCount(plan: DailyPlan | undefined): number {
   );
 }
 
+const SUMMARY_OUTCOMES: DaySummaryOutcome[] = [
+  "done",
+  "tomorrow",
+  "later",
+  "blocked",
+  "deleted",
+];
+
+export function getRecentDaySummaries(
+  data: DaymarkData,
+  today = localDateKey(),
+  days = 7,
+): DaySummary[] {
+  const length = Math.max(1, Math.floor(days));
+  return Array.from({ length }, (_, index) => {
+    const date = shiftDate(today, index - length + 1);
+    const counts: DaySummary["counts"] = {
+      done: 0,
+      tomorrow: 0,
+      later: 0,
+      blocked: 0,
+      deleted: 0,
+    };
+    const plan = getPlan(data, date);
+    for (const item of plan?.items ?? []) {
+      if (SUMMARY_OUTCOMES.includes(item.outcome as DaySummaryOutcome)) {
+        counts[item.outcome as DaySummaryOutcome] += 1;
+      }
+    }
+    return { date, counts };
+  });
+}
+
+function taskHistoryDate(
+  data: DaymarkData,
+  task: DaymarkTask,
+): { date: string; outcome: TaskHistoryEntry["outcome"] } | null {
+  const planEvents = data.plans
+    .flatMap((plan) =>
+      plan.items
+        .filter(
+          (item) => item.taskId === task.id && item.outcome !== "pending",
+        )
+        .map((item) => ({
+          date: item.resolvedAt
+            ? localDateKey(new Date(item.resolvedAt))
+            : plan.date,
+          outcome: item.outcome as TaskHistoryEntry["outcome"],
+        })),
+    )
+    .sort((a, b) => b.date.localeCompare(a.date));
+  if (planEvents[0]) return planEvents[0];
+  if (task.status === "done" || task.status === "deleted") {
+    return {
+      date: localDateKey(
+        new Date(task.settledAt ?? task.completedAt ?? task.createdAt),
+      ),
+      outcome: task.status,
+    };
+  }
+  return null;
+}
+
+export function searchTaskHistory(
+  data: DaymarkData,
+  query = "",
+): TaskHistoryEntry[] {
+  const normalized = query.trim().toLocaleLowerCase("ko-KR");
+  return data.tasks
+    .flatMap((task) => {
+      const event = taskHistoryDate(data, task);
+      if (!event) return [];
+      const haystack = [task.title, task.notes, task.blockedReason ?? ""]
+        .join("\n")
+        .toLocaleLowerCase("ko-KR");
+      if (normalized && !haystack.includes(normalized)) return [];
+      return [{ task, ...event }];
+    })
+    .sort(
+      (a, b) =>
+        b.date.localeCompare(a.date) ||
+        b.task.createdAt.localeCompare(a.task.createdAt),
+    );
+}
+
+export function getCleanupCandidates(
+  data: DaymarkData,
+  cutoffDate: string,
+): DaymarkTask[] {
+  return data.tasks.filter((task) => {
+    if (task.status !== "done" && task.status !== "deleted") return false;
+    const settledAt = task.settledAt ?? task.completedAt;
+    return Boolean(
+      settledAt && localDateKey(new Date(settledAt)) < cutoffDate,
+    );
+  });
+}
+
+export function pruneSettledTasks(
+  data: DaymarkData,
+  cutoffDate: string,
+  now = new Date(),
+): DaymarkData {
+  const candidateIds = new Set(
+    getCleanupCandidates(data, cutoffDate).map((task) => task.id),
+  );
+  if (candidateIds.size === 0) return data;
+  const plans = data.plans
+    .map((plan) => {
+      const items = plan.items.filter(
+        (item) => !candidateIds.has(item.taskId),
+      );
+      return {
+        ...plan,
+        items,
+        currentTaskId:
+          plan.currentTaskId && candidateIds.has(plan.currentTaskId)
+            ? null
+            : plan.currentTaskId,
+      };
+    })
+    .filter((plan) => plan.items.length > 0);
+  return stamp(
+    {
+      ...data,
+      tasks: data.tasks.filter((task) => !candidateIds.has(task.id)),
+      plans,
+    },
+    now,
+  );
+}
+
 export function getReviewItems(
   data: DaymarkData,
   today = localDateKey(),
@@ -776,6 +935,7 @@ export function addTaskToToday(
               reviewOn: null,
               blockedReason: null,
               completedAt: null,
+              settledAt: null,
             }
           : item,
       ),
@@ -965,6 +1125,7 @@ function applyTaskFields(
       ...task,
       status: "done",
       completedAt: now.toISOString(),
+      settledAt: now.toISOString(),
       reviewOn: null,
       blockedReason: null,
     };
@@ -974,6 +1135,7 @@ function applyTaskFields(
       ...task,
       status: "later",
       completedAt: null,
+      settledAt: null,
       reviewOn: shiftDate(today, 1),
       blockedReason: null,
     };
@@ -983,6 +1145,7 @@ function applyTaskFields(
       ...task,
       status: "later",
       completedAt: null,
+      settledAt: null,
       reviewOn: null,
       blockedReason: null,
     };
@@ -999,6 +1162,7 @@ function applyTaskFields(
       ...task,
       status: "blocked",
       completedAt: null,
+      settledAt: null,
       reviewOn: blocked.reviewOn,
       blockedReason: blocked.reason.trim(),
     };
@@ -1007,6 +1171,7 @@ function applyTaskFields(
     ...task,
     status: "deleted",
     completedAt: null,
+    settledAt: now.toISOString(),
     reviewOn: null,
     blockedReason: null,
   };

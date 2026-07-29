@@ -32,6 +32,7 @@ export interface DaymarkTask {
   estimateMinutes: number | null;
   createdAt: string;
   completedAt: string | null;
+  settledAt: string | null;
   blockedReason: string | null;
   reviewOn: string | null;
   legacy: {
@@ -79,6 +80,24 @@ export interface ReviewItem {
   taskId: string;
   source: "stale-plan" | "scheduled";
   planDate: string | null;
+}
+
+export type DaySummaryOutcome =
+  | "done"
+  | "tomorrow"
+  | "later"
+  | "blocked"
+  | "deleted";
+
+export interface DaySummary {
+  date: string;
+  counts: Record<DaySummaryOutcome, number>;
+}
+
+export interface TaskHistoryEntry {
+  task: DaymarkTask;
+  date: string;
+  outcome: PlanOutcome | TaskStatus;
 }
 
 export interface BlockedDetails {
