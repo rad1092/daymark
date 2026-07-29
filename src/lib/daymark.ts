@@ -1,10 +1,14 @@
 import type {
   BlockedDetails,
+  DayReceipt,
+  DayReceiptItem,
   DaySummary,
   DaySummaryOutcome,
   DailyPlan,
   DaymarkData,
+  DaymarkSnapshot,
   DaymarkTask,
+  DeferredDetails,
   LegacyFocusRecord,
   PlanItem,
   PlanOutcome,
@@ -15,11 +19,18 @@ import type {
   TaskStatus,
 } from "../types";
 
-export const DATA_VERSION = 2 as const;
-export const STORAGE_KEY = "daymark:data:v2";
-export const BACKUP_KEY = "daymark:data:backup:v2";
+export const DATA_VERSION = 3 as const;
+export const STORAGE_KEY = "daymark:data:v3";
+export const BACKUP_KEY = "daymark:data:backup:v3";
+export const CORRUPT_PRIMARY_KEY = "daymark:data:corrupt:v3";
+export const CORRUPT_HISTORY_KEY = "daymark:data:corrupt-history:v3";
+export const SNAPSHOTS_KEY = "daymark:snapshots:v3";
+export const V2_STORAGE_KEY = "daymark:data:v2";
+export const V2_BACKUP_KEY = "daymark:data:backup:v2";
 export const LEGACY_STORAGE_KEY = "daymark:data:v1";
 export const LEGACY_BACKUP_KEY = "daymark:data:backup";
+const SNAPSHOT_LIMIT = 20;
+const CORRUPT_HISTORY_LIMIT = 5;
 
 const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const TASK_STATUSES: TaskStatus[] = [
@@ -52,6 +63,12 @@ export interface StorageLike {
   removeItem(key: string): void;
 }
 
+interface CorruptStorageRecord {
+  capturedAt: string;
+  source: "primary" | "backup";
+  raw: string;
+}
+
 interface LegacyTask {
   id: string;
   title: string;
@@ -72,6 +89,23 @@ interface LegacyData {
   tasks: LegacyTask[];
   focusRecords: LegacyFocusRecord[];
   updatedAt?: string;
+}
+
+interface V2Task
+  extends Omit<DaymarkTask, "nextStep" | "settledAt"> {
+  settledAt?: string | null;
+}
+
+type V2Plan = Omit<DailyPlan, "initialCommitmentIds" | "receipt">;
+
+interface V2Data {
+  schemaVersion: 2;
+  tasks: V2Task[];
+  plans: V2Plan[];
+  archive: {
+    legacyFocusRecords: LegacyFocusRecord[];
+  };
+  updatedAt: string;
 }
 
 export function createId(prefix = "item"): string {
@@ -132,6 +166,7 @@ export function createTask(
     id: createId("task"),
     title: title.trim(),
     notes: "",
+    nextStep: "",
     status: "inbox",
     estimateMinutes: null,
     createdAt: now.toISOString(),
@@ -147,6 +182,7 @@ export function createTask(
 export function createEmptyData(now = new Date()): DaymarkData {
   return {
     schemaVersion: DATA_VERSION,
+    revision: 0,
     tasks: [],
     plans: [],
     archive: {
@@ -177,6 +213,7 @@ function isTask(value: unknown): value is DaymarkTask {
     typeof value.id === "string" &&
     typeof value.title === "string" &&
     typeof value.notes === "string" &&
+    typeof value.nextStep === "string" &&
     TASK_STATUSES.includes(value.status as TaskStatus) &&
     (value.estimateMinutes === null ||
       (typeof value.estimateMinutes === "number" &&
@@ -189,6 +226,12 @@ function isTask(value: unknown): value is DaymarkTask {
     isNullableString(value.blockedReason) &&
     isNullableString(value.reviewOn) &&
     (value.reviewOn === null || DATE_PATTERN.test(value.reviewOn)) &&
+    ((value.status !== "later" && value.status !== "blocked") ||
+      (typeof value.reviewOn === "string" &&
+        DATE_PATTERN.test(value.reviewOn))) &&
+    (value.status !== "blocked" ||
+      (typeof value.blockedReason === "string" &&
+        value.blockedReason.trim().length > 0)) &&
     validLegacy
   );
 }
@@ -211,10 +254,67 @@ function isPlan(value: unknown): value is DailyPlan {
     PLAN_STATUSES.includes(value.status as DailyPlan["status"]) &&
     Array.isArray(value.items) &&
     value.items.every(isPlanItem) &&
+    Array.isArray(value.initialCommitmentIds) &&
+    value.initialCommitmentIds.length <= 3 &&
+    value.initialCommitmentIds.every((id) => typeof id === "string") &&
     isNullableString(value.currentTaskId) &&
     isNullableString(value.startedAt) &&
-    isNullableString(value.closedAt)
+    isNullableString(value.closedAt) &&
+    (value.receipt === null || isReceipt(value.receipt))
   );
+}
+
+function isReceiptItem(value: unknown): value is DayReceiptItem {
+  if (!isObject(value)) return false;
+  return (
+    typeof value.taskId === "string" &&
+    typeof value.title === "string" &&
+    value.outcome !== "pending" &&
+    PLAN_OUTCOMES.includes(value.outcome as PlanOutcome) &&
+    typeof value.nextStep === "string" &&
+    isNullableString(value.reviewOn) &&
+    (value.reviewOn === null || DATE_PATTERN.test(value.reviewOn))
+  );
+}
+
+function isReceipt(value: unknown): value is DayReceipt {
+  if (!isObject(value)) return false;
+  return (
+    typeof value.date === "string" &&
+    DATE_PATTERN.test(value.date) &&
+    typeof value.closedAt === "string" &&
+    Array.isArray(value.items) &&
+    value.items.length <= 3 &&
+    value.items.every(isReceiptItem)
+  );
+}
+
+function createReceipt(
+  plan: DailyPlan,
+  tasks: DaymarkTask[],
+  closedAt: string,
+): DayReceipt {
+  const taskById = new Map(tasks.map((task) => [task.id, task]));
+  return {
+    date: plan.date,
+    closedAt,
+    items: plan.initialCommitmentIds.map((taskId) => {
+      const item = plan.items.find(
+        (candidate) => candidate.taskId === taskId,
+      );
+      const task = taskById.get(taskId);
+      if (!item || !task || item.outcome === "pending") {
+        throw new Error("오늘의 약속 결과를 확인할 수 없습니다.");
+      }
+      return {
+        taskId,
+        title: task.title,
+        outcome: item.outcome,
+        nextStep: task.nextStep,
+        reviewOn: task.reviewOn,
+      };
+    }),
+  };
 }
 
 function isLegacyFocusRecord(value: unknown): value is LegacyFocusRecord {
@@ -239,6 +339,13 @@ export function parseDaymarkData(raw: string): DaymarkData {
   }
   if (!isObject(parsed) || parsed.schemaVersion !== DATA_VERSION) {
     throw new Error("지원하지 않는 Daymark 백업 버전입니다.");
+  }
+  if (
+    typeof parsed.revision !== "number" ||
+    !Number.isSafeInteger(parsed.revision) ||
+    parsed.revision < 0
+  ) {
+    throw new Error("데이터 변경 번호를 확인할 수 없습니다.");
   }
   if (!Array.isArray(parsed.tasks) || !parsed.tasks.every(isTask)) {
     throw new Error("할 일 데이터가 손상되었습니다.");
@@ -270,6 +377,10 @@ export function parseDaymarkData(raw: string): DaymarkData {
   const pendingTaskIds = new Set<string>();
   for (const plan of data.plans) {
     const itemTaskIds = new Set<string>();
+    const initialIds = new Set(plan.initialCommitmentIds);
+    if (initialIds.size !== plan.initialCommitmentIds.length) {
+      throw new Error("오늘의 약속이 중복되었습니다.");
+    }
     for (const item of plan.items) {
       if (!taskIds.has(item.taskId)) {
         throw new Error("계획이 존재하지 않는 할 일을 참조합니다.");
@@ -283,6 +394,27 @@ export function parseDaymarkData(raw: string): DaymarkData {
           throw new Error("같은 할 일이 여러 날짜에 미처리 상태입니다.");
         }
         pendingTaskIds.add(item.taskId);
+      }
+    }
+    if (
+      plan.initialCommitmentIds.some(
+        (taskId) => !itemTaskIds.has(taskId),
+      )
+    ) {
+      throw new Error("오늘의 약속이 계획 항목과 일치하지 않습니다.");
+    }
+    if (plan.receipt) {
+      if (plan.receipt.date !== plan.date) {
+        throw new Error("하루 정리 기록의 날짜가 일치하지 않습니다.");
+      }
+      if (
+        plan.receipt.items.some(
+          (item) =>
+            !itemTaskIds.has(item.taskId) ||
+            !initialIds.has(item.taskId),
+        )
+      ) {
+        throw new Error("하루 정리 기록이 약속과 일치하지 않습니다.");
       }
     }
     if (
@@ -348,10 +480,90 @@ export function parseBackupData(
   if (header.schemaVersion === DATA_VERSION) {
     return { data: parseDaymarkData(raw), migrated: false };
   }
+  if (header.schemaVersion === 2) {
+    return { data: migrateV2Data(raw, today, now), migrated: true };
+  }
   if (header.schemaVersion === 1) {
     return { data: migrateLegacyData(raw, today, now), migrated: true };
   }
   throw new Error("지원하지 않는 Daymark 백업 버전입니다.");
+}
+
+function parseV2Data(raw: string): V2Data {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("이전 Daymark 데이터를 읽을 수 없습니다.");
+  }
+  if (
+    !isObject(parsed) ||
+    parsed.schemaVersion !== 2 ||
+    !Array.isArray(parsed.tasks) ||
+    !parsed.tasks.every(isObject) ||
+    !Array.isArray(parsed.plans) ||
+    !parsed.plans.every(
+      (plan) =>
+        isObject(plan) &&
+        Array.isArray(plan.items) &&
+        plan.items.every(isObject),
+    ) ||
+    !isObject(parsed.archive) ||
+    !Array.isArray(parsed.archive.legacyFocusRecords) ||
+    typeof parsed.updatedAt !== "string"
+  ) {
+    throw new Error("이전 Daymark 데이터가 손상되었습니다.");
+  }
+  return parsed as unknown as V2Data;
+}
+
+export function migrateV2Data(
+  raw: string,
+  today = localDateKey(),
+  now = new Date(),
+): DaymarkData {
+  const legacy = parseV2Data(raw);
+  const tasks = legacy.tasks.map<DaymarkTask>((task) => ({
+    ...task,
+    nextStep: "",
+    settledAt: task.settledAt ?? task.completedAt ?? null,
+    reviewOn:
+      task.status === "later" && task.reviewOn === null
+        ? today
+        : task.reviewOn,
+  }));
+  const plans = legacy.plans.map<DailyPlan>((plan) => {
+    const initialCommitmentIds =
+      plan.status === "draft"
+        ? []
+        : plan.items.slice(0, 3).map((item) => item.taskId);
+    const closedAt =
+      plan.closedAt ??
+      (plan.status === "closed" ? legacy.updatedAt : null);
+    const migratedPlan: DailyPlan = {
+      ...plan,
+      initialCommitmentIds,
+      closedAt,
+      receipt: null,
+    };
+    return {
+      ...migratedPlan,
+      receipt:
+        plan.status === "closed" && closedAt
+          ? createReceipt(migratedPlan, tasks, closedAt)
+          : null,
+    };
+  });
+  return parseDaymarkData(
+    JSON.stringify({
+      schemaVersion: DATA_VERSION,
+      revision: 0,
+      tasks,
+      plans,
+      archive: legacy.archive,
+      updatedAt: now.toISOString(),
+    }),
+  );
 }
 
 function isLegacyTask(value: unknown): value is LegacyTask {
@@ -434,6 +646,7 @@ export function migrateLegacyData(
       id: task.id,
       title: task.title,
       notes: task.notes,
+      nextStep: "",
       status,
       estimateMinutes:
         Number.isFinite(task.durationMinutes) &&
@@ -485,14 +698,17 @@ export function migrateLegacyData(
         outcome: "pending",
         resolvedAt: null,
       })),
+      initialCommitmentIds: [],
       currentTaskId: null,
       startedAt: null,
       closedAt: null,
+      receipt: null,
     });
   }
 
   return {
     schemaVersion: DATA_VERSION,
+    revision: 0,
     tasks,
     plans: plans.sort((a, b) => a.date.localeCompare(b.date)),
     archive: {
@@ -502,10 +718,23 @@ export function migrateLegacyData(
   };
 }
 
-function tryParseV2(raw: string | null): DaymarkData | null {
+function tryParseV3(raw: string | null): DaymarkData | null {
   if (!raw) return null;
   try {
     return parseDaymarkData(raw);
+  } catch {
+    return null;
+  }
+}
+
+function tryMigrateV2(
+  raw: string | null,
+  today: string,
+  now: Date,
+): DaymarkData | null {
+  if (!raw) return null;
+  try {
+    return migrateV2Data(raw, today, now);
   } catch {
     return null;
   }
@@ -530,24 +759,26 @@ export function loadStoredData(
   now = new Date(),
 ): StorageLoadResult {
   const primaryRaw = storage.getItem(STORAGE_KEY);
-  const primary = tryParseV2(primaryRaw);
+  const primary = tryParseV3(primaryRaw);
   if (primary) {
     return {
       data: primary,
       recovered: false,
+      needsRecovery: false,
       migrated: false,
       issue: null,
     };
   }
 
   const backupRaw = storage.getItem(BACKUP_KEY);
-  const backup = tryParseV2(backupRaw);
+  const backup = tryParseV3(backupRaw);
   if (backup) {
     return {
       data: backup,
       recovered: true,
+      needsRecovery: true,
       migrated: false,
-      issue: "마지막 정상 백업에서 데이터를 복구했습니다.",
+      issue: "마지막 정상 백업을 열었습니다. 복구를 확정해 주세요.",
     };
   }
 
@@ -555,9 +786,42 @@ export function loadStoredData(
     return {
       data: null,
       recovered: false,
+      needsRecovery: false,
       migrated: false,
       issue:
         "저장된 데이터를 읽지 못했습니다. 원본을 보관하고 자동 저장을 중지했습니다.",
+    };
+  }
+
+  const v2Primary = tryMigrateV2(
+    storage.getItem(V2_STORAGE_KEY),
+    today,
+    now,
+  );
+  if (v2Primary) {
+    return {
+      data: v2Primary,
+      recovered: false,
+      needsRecovery: false,
+      migrated: true,
+      issue:
+        "기존 데이터를 새 형식으로 옮겼습니다. 날짜가 없던 나중 항목은 오늘 검토에 올렸습니다.",
+    };
+  }
+
+  const v2Backup = tryMigrateV2(
+    storage.getItem(V2_BACKUP_KEY),
+    today,
+    now,
+  );
+  if (v2Backup) {
+    return {
+      data: v2Backup,
+      recovered: true,
+      needsRecovery: false,
+      migrated: true,
+      issue:
+        "이전 백업을 새 형식으로 옮겼습니다. 날짜가 없던 나중 항목은 오늘 검토에 올렸습니다.",
     };
   }
 
@@ -570,6 +834,7 @@ export function loadStoredData(
     return {
       data: legacyPrimary,
       recovered: false,
+      needsRecovery: false,
       migrated: true,
       issue:
         "기존 데이터를 새 형식으로 옮겼습니다. 이전 원본은 그대로 보관됩니다.",
@@ -585,6 +850,7 @@ export function loadStoredData(
     return {
       data: legacyBackup,
       recovered: true,
+      needsRecovery: false,
       migrated: true,
       issue:
         "이전 백업을 새 형식으로 옮겼습니다. 이전 원본은 그대로 보관됩니다.",
@@ -592,12 +858,15 @@ export function loadStoredData(
   }
 
   const hadUnreadableData = Boolean(
+    storage.getItem(V2_STORAGE_KEY) ||
+      storage.getItem(V2_BACKUP_KEY) ||
     storage.getItem(LEGACY_STORAGE_KEY) ||
       storage.getItem(LEGACY_BACKUP_KEY),
   );
   return {
     data: null,
     recovered: false,
+    needsRecovery: false,
     migrated: false,
     issue: hadUnreadableData
       ? "저장된 데이터를 읽지 못했습니다. 원본을 보관하고 자동 저장을 중지했습니다."
@@ -608,8 +877,21 @@ export function loadStoredData(
 export function saveStoredData(
   storage: StorageLike,
   data: DaymarkData,
+  expectedData?: DaymarkData,
 ): void {
-  const previous = storage.getItem(STORAGE_KEY);
+  const currentRaw = storage.getItem(STORAGE_KEY);
+  if (expectedData && currentRaw) {
+    const current = parseDaymarkData(currentRaw);
+    if (
+      current.revision !== expectedData.revision ||
+      JSON.stringify(current) !== JSON.stringify(expectedData)
+    ) {
+      throw new Error(
+        "다른 탭에서 데이터가 바뀌었습니다. 이 탭을 새로 불러오세요.",
+      );
+    }
+  }
+  const previous = currentRaw;
   if (previous) {
     try {
       parseDaymarkData(previous);
@@ -621,9 +903,220 @@ export function saveStoredData(
   storage.setItem(STORAGE_KEY, JSON.stringify(data));
 }
 
+function loadCorruptHistory(storage: StorageLike): CorruptStorageRecord[] {
+  const raw = storage.getItem(CORRUPT_HISTORY_KEY);
+  if (!raw) return [];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (item): item is CorruptStorageRecord =>
+        isObject(item) &&
+        typeof item.capturedAt === "string" &&
+        (item.source === "primary" || item.source === "backup") &&
+        typeof item.raw === "string",
+    );
+  } catch {
+    return [];
+  }
+}
+
+function appendCorruptHistory(
+  storage: StorageLike,
+  records: CorruptStorageRecord[],
+): void {
+  if (records.length === 0) return;
+  const combined = [...loadCorruptHistory(storage), ...records];
+  const unique = combined.filter(
+    (record, index) =>
+      combined.findIndex(
+        (candidate) =>
+          candidate.source === record.source &&
+          candidate.raw === record.raw,
+      ) === index,
+  );
+  storage.setItem(
+    CORRUPT_HISTORY_KEY,
+    JSON.stringify(unique.slice(-CORRUPT_HISTORY_LIMIT)),
+  );
+}
+
+function preserveCorruptPrimary(
+  storage: StorageLike,
+  primaryRaw: string,
+  now = new Date(),
+  additionalRecords: CorruptStorageRecord[] = [],
+): void {
+  const previous = storage.getItem(CORRUPT_PRIMARY_KEY);
+  const historyRecords = [...additionalRecords];
+  if (previous && previous !== primaryRaw) {
+    historyRecords.push({
+      capturedAt: now.toISOString(),
+      source: "primary",
+      raw: previous,
+    });
+  }
+  appendCorruptHistory(storage, historyRecords);
+  storage.setItem(CORRUPT_PRIMARY_KEY, primaryRaw);
+}
+
+export function confirmBackupRecovery(
+  storage: StorageLike,
+  recoveredData: DaymarkData,
+  now = new Date(),
+): void {
+  const backupRaw = storage.getItem(BACKUP_KEY);
+  if (!backupRaw) {
+    throw new Error("확정할 정상 백업을 찾지 못했습니다.");
+  }
+  const backup = parseDaymarkData(backupRaw);
+  if (JSON.stringify(backup) !== JSON.stringify(recoveredData)) {
+    throw new Error("열린 데이터가 마지막 정상 백업과 다릅니다.");
+  }
+
+  const primaryRaw = storage.getItem(STORAGE_KEY);
+  if (primaryRaw && tryParseV3(primaryRaw)) {
+    throw new Error("현재 저장 데이터가 정상이므로 복구를 덮어쓸 수 없습니다.");
+  }
+  if (primaryRaw) {
+    preserveCorruptPrimary(storage, primaryRaw, now);
+  }
+  storage.setItem(STORAGE_KEY, JSON.stringify(backup));
+}
+
+export function replaceUnreadableStoredData(
+  storage: StorageLike,
+  replacement: DaymarkData,
+  now = new Date(),
+): void {
+  const primaryRaw = storage.getItem(STORAGE_KEY);
+  if (primaryRaw && tryParseV3(primaryRaw)) {
+    throw new Error("현재 저장 데이터가 정상이므로 덮어쓸 수 없습니다.");
+  }
+
+  const backupRaw = storage.getItem(BACKUP_KEY);
+  const additionalRecords: CorruptStorageRecord[] = [];
+  if (
+    backupRaw &&
+    !tryParseV3(backupRaw) &&
+    backupRaw !== primaryRaw
+  ) {
+    additionalRecords.push({
+      capturedAt: now.toISOString(),
+      source: "backup",
+      raw: backupRaw,
+    });
+  }
+  if (primaryRaw) {
+    preserveCorruptPrimary(
+      storage,
+      primaryRaw,
+      now,
+      additionalRecords,
+    );
+  } else {
+    appendCorruptHistory(storage, additionalRecords);
+  }
+  storage.setItem(STORAGE_KEY, JSON.stringify(replacement));
+}
+
+function parseSnapshot(value: unknown): DaymarkSnapshot | null {
+  if (
+    !isObject(value) ||
+    typeof value.id !== "string" ||
+    typeof value.createdAt !== "string" ||
+    typeof value.label !== "string" ||
+    !isObject(value.data)
+  ) {
+    return null;
+  }
+  try {
+    return {
+      id: value.id,
+      createdAt: value.createdAt,
+      label: value.label,
+      data: parseDaymarkData(JSON.stringify(value.data)),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function loadSnapshots(storage: StorageLike): DaymarkSnapshot[] {
+  const raw = storage.getItem(SNAPSHOTS_KEY);
+  if (!raw) return [];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .map(parseSnapshot)
+      .filter(
+        (snapshot): snapshot is DaymarkSnapshot => snapshot !== null,
+      )
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      .slice(0, SNAPSHOT_LIMIT);
+  } catch {
+    return [];
+  }
+}
+
+export function saveSnapshot(
+  storage: StorageLike,
+  data: DaymarkData,
+  label: string,
+  now = new Date(),
+): DaymarkSnapshot[] {
+  const snapshot: DaymarkSnapshot = {
+    id: createId("snapshot"),
+    createdAt: now.toISOString(),
+    label: label.trim() || "변경 전",
+    data,
+  };
+  const snapshots = [snapshot, ...loadSnapshots(storage)].slice(
+    0,
+    SNAPSHOT_LIMIT,
+  );
+  storage.setItem(SNAPSHOTS_KEY, JSON.stringify(snapshots));
+  return snapshots;
+}
+
+export function removeSnapshot(
+  storage: StorageLike,
+  snapshotId: string,
+): DaymarkSnapshot[] {
+  const snapshots = loadSnapshots(storage).filter(
+    (snapshot) => snapshot.id !== snapshotId,
+  );
+  storage.setItem(SNAPSHOTS_KEY, JSON.stringify(snapshots));
+  return snapshots;
+}
+
+export function restoreSnapshotData(
+  current: DaymarkData,
+  snapshot: DaymarkSnapshot,
+  now = new Date(),
+): DaymarkData {
+  return adoptImportedData(current, snapshot.data, now);
+}
+
+export function adoptImportedData(
+  current: DaymarkData,
+  imported: DaymarkData,
+  now = new Date(),
+): DaymarkData {
+  return stamp(
+    {
+      ...imported,
+      revision: current.revision,
+    },
+    now,
+  );
+}
+
 function stamp(data: DaymarkData, now: Date): DaymarkData {
   return {
     ...data,
+    revision: data.revision + 1,
     updatedAt: now.toISOString(),
   };
 }
@@ -652,6 +1145,16 @@ export function getCommittedCount(plan: DailyPlan | undefined): number {
       (item) => item.outcome === "pending" || item.outcome === "done",
     ).length ?? 0
   );
+}
+
+export function getRecentReceipts(
+  data: DaymarkData,
+  limit = 7,
+): DayReceipt[] {
+  return data.plans
+    .flatMap((plan) => (plan.receipt ? [plan.receipt] : []))
+    .sort((a, b) => b.date.localeCompare(a.date))
+    .slice(0, Math.max(1, Math.floor(limit)));
 }
 
 const SUMMARY_OUTCOMES: DaySummaryOutcome[] = [
@@ -769,10 +1272,21 @@ export function pruneSettledTasks(
       return {
         ...plan,
         items,
+        initialCommitmentIds: plan.initialCommitmentIds.filter(
+          (taskId) => !candidateIds.has(taskId),
+        ),
         currentTaskId:
           plan.currentTaskId && candidateIds.has(plan.currentTaskId)
             ? null
             : plan.currentTaskId,
+        receipt: plan.receipt
+          ? {
+              ...plan.receipt,
+              items: plan.receipt.items.filter(
+                (item) => !candidateIds.has(item.taskId),
+              ),
+            }
+          : null,
       };
     })
     .filter((plan) => plan.items.length > 0);
@@ -846,9 +1360,11 @@ function createDraftPlan(date: string): DailyPlan {
     date,
     status: "draft",
     items: [],
+    initialCommitmentIds: [],
     currentTaskId: null,
     startedAt: null,
     closedAt: null,
+    receipt: null,
   };
 }
 
@@ -889,6 +1405,9 @@ export function addTaskToToday(
   const existingPlan = getPlan(data, today);
   if (existingPlan?.status === "closed") {
     throw new Error("오늘은 이미 정리했습니다.");
+  }
+  if (existingPlan?.status === "active") {
+    throw new Error("시작한 뒤에는 오늘의 약속을 늘릴 수 없습니다.");
   }
   if (existingPlan?.status === "closing") {
     throw new Error("하루 정리를 마친 뒤 계획을 바꿀 수 있습니다.");
@@ -944,10 +1463,54 @@ export function addTaskToToday(
   );
 }
 
+export function removeTaskFromToday(
+  data: DaymarkData,
+  taskId: string,
+  today = localDateKey(),
+  now = new Date(),
+): DaymarkData {
+  const plan = getPlan(data, today);
+  const task = getTask(data, taskId);
+  if (
+    !plan ||
+    plan.status !== "draft" ||
+    !task ||
+    !plan.items.some(
+      (item) => item.taskId === taskId && item.outcome === "pending",
+    )
+  ) {
+    throw new Error("시작 전 약속만 오늘에서 뺄 수 있습니다.");
+  }
+  const nextPlan = {
+    ...plan,
+    items: plan.items.filter((item) => item.taskId !== taskId),
+  };
+  const withPlan = replacePlan(data, nextPlan);
+  return stamp(
+    {
+      ...withPlan,
+      tasks: withPlan.tasks.map((item) =>
+        item.id === taskId
+          ? {
+              ...item,
+              status: "inbox",
+              reviewOn: null,
+              blockedReason: null,
+            }
+          : item,
+      ),
+    },
+    now,
+  );
+}
+
 export function updateTask(
   data: DaymarkData,
   taskId: string,
-  patch: Pick<Partial<DaymarkTask>, "title" | "notes" | "estimateMinutes">,
+  patch: Pick<
+    Partial<DaymarkTask>,
+    "title" | "notes" | "nextStep" | "estimateMinutes"
+  >,
   now = new Date(),
 ): DaymarkData {
   const task = getTask(data, taskId);
@@ -998,6 +1561,10 @@ export function startPlan(
   const nextPlan: DailyPlan = {
     ...plan,
     status: "active",
+    initialCommitmentIds:
+      plan.initialCommitmentIds.length > 0
+        ? plan.initialCommitmentIds
+        : pending.slice(0, 3).map((item) => item.taskId),
     currentTaskId:
       plan.currentTaskId &&
       pending.some((item) => item.taskId === plan.currentTaskId)
@@ -1095,16 +1662,72 @@ export function closeDay(
 ): DaymarkData {
   const plan = getPlan(data, today);
   if (!plan) throw new Error("정리할 오늘 계획이 없습니다.");
+  if (plan.status !== "closing") {
+    throw new Error("하루 정리를 먼저 시작해 주세요.");
+  }
   if (getPendingPlanItems(plan).length > 0) {
     throw new Error("남은 약속을 먼저 처리해 주세요.");
   }
+  const closedAt = now.toISOString();
+  const closedPlan: DailyPlan = {
+    ...plan,
+    status: "closed",
+    currentTaskId: null,
+    closedAt,
+    receipt: null,
+  };
   return stamp(
     replacePlan(data, {
-      ...plan,
-      status: "closed",
-      currentTaskId: null,
-      closedAt: now.toISOString(),
+      ...closedPlan,
+      receipt: createReceipt(closedPlan, data.tasks, closedAt),
     }),
+    now,
+  );
+}
+
+export function reopenDay(
+  data: DaymarkData,
+  today = localDateKey(),
+  now = new Date(),
+): DaymarkData {
+  const plan = getPlan(data, today);
+  if (!plan || plan.status !== "closed") {
+    throw new Error("오늘 닫은 계획만 다시 열 수 있습니다.");
+  }
+  const commitmentIds = new Set(plan.initialCommitmentIds);
+  const nextPlan: DailyPlan = {
+    ...plan,
+    status: "active",
+    items: plan.items.map((item) =>
+      commitmentIds.has(item.taskId)
+        ? {
+            ...item,
+            outcome: "pending",
+            resolvedAt: null,
+          }
+        : item,
+    ),
+    currentTaskId: plan.initialCommitmentIds[0] ?? null,
+    closedAt: null,
+    receipt: null,
+  };
+  const withPlan = replacePlan(data, nextPlan);
+  return stamp(
+    {
+      ...withPlan,
+      tasks: withPlan.tasks.map((task) =>
+        commitmentIds.has(task.id)
+          ? {
+              ...task,
+              status: "planned",
+              completedAt: null,
+              settledAt: null,
+              reviewOn: null,
+              blockedReason: null,
+            }
+          : task,
+      ),
+    },
     now,
   );
 }
@@ -1118,7 +1741,7 @@ function applyTaskFields(
   action: TaskAction,
   today: string,
   now: Date,
-  blocked?: BlockedDetails,
+  details?: BlockedDetails | DeferredDetails,
 ): DaymarkTask {
   if (action === "done") {
     return {
@@ -1131,32 +1754,53 @@ function applyTaskFields(
     };
   }
   if (action === "tomorrow") {
+    const nextStep = details?.nextStep.trim() ?? "";
+    if (!nextStep) {
+      throw new Error("다음에 시작할 지점을 입력해 주세요.");
+    }
     return {
       ...task,
       status: "later",
       completedAt: null,
       settledAt: null,
       reviewOn: shiftDate(today, 1),
+      nextStep,
       blockedReason: null,
     };
   }
   if (action === "later") {
+    const nextStep = details?.nextStep.trim() ?? "";
+    const reviewOn = details?.reviewOn ?? "";
+    if (
+      !nextStep ||
+      !DATE_PATTERN.test(reviewOn) ||
+      reviewOn <= today
+    ) {
+      throw new Error(
+        "다시 볼 날짜와 다음에 시작할 지점을 입력해 주세요.",
+      );
+    }
     return {
       ...task,
       status: "later",
       completedAt: null,
       settledAt: null,
-      reviewOn: null,
+      reviewOn,
+      nextStep,
       blockedReason: null,
     };
   }
   if (action === "blocked") {
+    const blocked = details as BlockedDetails | undefined;
     if (
       !blocked?.reason.trim() ||
       !DATE_PATTERN.test(blocked.reviewOn) ||
-      blocked.reviewOn <= today
+      blocked.reviewOn <= today ||
+      !blocked.nextStep.trim()
     ) {
-      throw new Error("막힌 이유와 오늘 이후의 다시 볼 날짜를 입력해 주세요.");
+      throw new Error(
+        "막힌 이유, 다시 볼 날짜, 다음에 시작할 지점을 입력해 주세요.",
+      );
     }
     return {
       ...task,
@@ -1164,6 +1808,7 @@ function applyTaskFields(
       completedAt: null,
       settledAt: null,
       reviewOn: blocked.reviewOn,
+      nextStep: blocked.nextStep.trim(),
       blockedReason: blocked.reason.trim(),
     };
   }
@@ -1184,18 +1829,27 @@ function settleOldPlans(
 ): DaymarkData {
   return {
     ...data,
-    plans: data.plans.map((plan) =>
-      plan.date < today &&
-      plan.status !== "closed" &&
-      getPendingPlanItems(plan).length === 0
-        ? {
-            ...plan,
-            status: "closed",
-            currentTaskId: null,
-            closedAt: plan.closedAt ?? now.toISOString(),
-          }
-        : plan,
-    ),
+    plans: data.plans.map((plan) => {
+      if (
+        plan.date >= today ||
+        plan.status === "closed" ||
+        getPendingPlanItems(plan).length > 0
+      ) {
+        return plan;
+      }
+      const closedAt = plan.closedAt ?? now.toISOString();
+      const closedPlan: DailyPlan = {
+        ...plan,
+        status: "closed",
+        currentTaskId: null,
+        closedAt,
+        receipt: null,
+      };
+      return {
+        ...closedPlan,
+        receipt: createReceipt(closedPlan, data.tasks, closedAt),
+      };
+    }),
   };
 }
 
@@ -1206,7 +1860,7 @@ export function actOnPlannedTask(
   action: TaskAction,
   today = localDateKey(),
   now = new Date(),
-  blocked?: BlockedDetails,
+  details?: BlockedDetails | DeferredDetails,
 ): DaymarkData {
   const plan = getPlan(data, planDate);
   const task = getTask(data, taskId);
@@ -1242,7 +1896,7 @@ export function actOnPlannedTask(
     ...withPlan,
     tasks: withPlan.tasks.map((item) =>
       item.id === taskId
-        ? applyTaskFields(item, action, today, now, blocked)
+        ? applyTaskFields(item, action, today, now, details)
         : item,
     ),
   };
@@ -1255,7 +1909,7 @@ export function actOnLooseTask(
   action: Exclude<TaskAction, "done">,
   today = localDateKey(),
   now = new Date(),
-  blocked?: BlockedDetails,
+  details?: BlockedDetails | DeferredDetails,
 ): DaymarkData {
   const task = getTask(data, taskId);
   if (!task || task.status === "planned" || task.status === "done") {
@@ -1266,7 +1920,7 @@ export function actOnLooseTask(
       ...data,
       tasks: data.tasks.map((item) =>
         item.id === taskId
-          ? applyTaskFields(item, action, today, now, blocked)
+          ? applyTaskFields(item, action, today, now, details)
           : item,
       ),
     },
@@ -1306,7 +1960,7 @@ export function resolveReviewItem(
   action: TaskAction | "today",
   today = localDateKey(),
   now = new Date(),
-  blocked?: BlockedDetails,
+  details?: BlockedDetails | DeferredDetails,
 ): DaymarkData {
   if (action === "today") {
     const carried =
@@ -1323,7 +1977,7 @@ export function resolveReviewItem(
       action,
       today,
       now,
-      blocked,
+      details,
     );
   }
   const task = getTask(data, item.taskId);
@@ -1333,7 +1987,7 @@ export function resolveReviewItem(
       ...data,
       tasks: data.tasks.map((candidate) =>
         candidate.id === item.taskId
-          ? applyTaskFields(candidate, action, today, now, blocked)
+          ? applyTaskFields(candidate, action, today, now, details)
           : candidate,
       ),
     },

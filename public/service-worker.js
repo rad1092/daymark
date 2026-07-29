@@ -1,16 +1,14 @@
 const CACHE_PREFIX = "daymark-shell-";
 const RELEASE_ID = "__DAYMARK_RELEASE__";
 const CACHE_VERSION = `${CACHE_PREFIX}${RELEASE_ID}`;
+const PRECACHE_FILES = "__DAYMARK_ASSETS__";
 const scopeUrl = new URL(self.registration.scope);
 const basePath = scopeUrl.pathname.endsWith("/")
   ? scopeUrl.pathname
   : `${scopeUrl.pathname}/`;
 const shellFiles = [
   basePath,
-  `${basePath}index.html`,
-  `${basePath}manifest.webmanifest`,
-  `${basePath}icons/daymark-192.png`,
-  `${basePath}icons/daymark-512.png`,
+  ...PRECACHE_FILES.map((filename) => `${basePath}${filename}`),
 ];
 
 self.addEventListener("install", (event) => {

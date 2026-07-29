@@ -28,6 +28,7 @@ export interface DaymarkTask {
   id: string;
   title: string;
   notes: string;
+  nextStep: string;
   status: TaskStatus;
   estimateMinutes: number | null;
   createdAt: string;
@@ -52,9 +53,11 @@ export interface DailyPlan {
   date: string;
   status: PlanStatus;
   items: PlanItem[];
+  initialCommitmentIds: string[];
   currentTaskId: string | null;
   startedAt: string | null;
   closedAt: string | null;
+  receipt: DayReceipt | null;
 }
 
 export interface LegacyFocusRecord {
@@ -67,7 +70,8 @@ export interface LegacyFocusRecord {
 }
 
 export interface DaymarkData {
-  schemaVersion: 2;
+  schemaVersion: 3;
+  revision: number;
   tasks: DaymarkTask[];
   plans: DailyPlan[];
   archive: {
@@ -103,11 +107,39 @@ export interface TaskHistoryEntry {
 export interface BlockedDetails {
   reason: string;
   reviewOn: string;
+  nextStep: string;
+}
+
+export interface DeferredDetails {
+  reviewOn: string;
+  nextStep: string;
+}
+
+export interface DayReceiptItem {
+  taskId: string;
+  title: string;
+  outcome: Exclude<PlanOutcome, "pending">;
+  nextStep: string;
+  reviewOn: string | null;
+}
+
+export interface DayReceipt {
+  date: string;
+  closedAt: string;
+  items: DayReceiptItem[];
+}
+
+export interface DaymarkSnapshot {
+  id: string;
+  createdAt: string;
+  label: string;
+  data: DaymarkData;
 }
 
 export interface StorageLoadResult {
   data: DaymarkData | null;
   recovered: boolean;
+  needsRecovery: boolean;
   migrated: boolean;
   issue: string | null;
 }
