@@ -6,7 +6,13 @@ const sourceFiles = ["src/**/*.{ts,tsx}"];
 
 export default tseslint.config(
   {
-    ignores: ["dist/**", "coverage/**", "node_modules/**", "public/**"],
+    ignores: [
+      "dist/**",
+      "coverage/**",
+      "node_modules/**",
+      "public/**",
+      "src-tauri/target/**",
+    ],
   },
   {
     ...js.configs.recommended,

@@ -1,0 +1,58 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "Daymark",
+  "version": "3.0.0-alpha.1",
+  "identifier": "net.whago.daymark",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "npm run software:web:dev",
+    "beforeBuildCommand": "npm run software:web:build"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Daymark",
+        "width": 420,
+        "height": 680,
+        "minWidth": 360,
+        "minHeight": 480,
+        "center": true,
+        "resizable": true,
+        "fullscreen": false,
+        "alwaysOnTop": false,
+        "backgroundColor": "#f3f0e8"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self' customprotocol: asset:; connect-src ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost data:; style-src 'self' 'unsafe-inline'; script-src 'self'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "Productivity",
+    "shortDescription": "오늘의 약속 세 개와 다시 시작할 지점을 남기는 로컬 소프트웨어.",
+    "longDescription": "Daymark는 오늘 끝낼 약속을 세 개까지 정하고, 중단된 일을 다시 시작할 지점을 로컬에 안전하게 보관합니다.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "createUpdaterArtifacts": false,
+    "macOS": {
+      "minimumSystemVersion": "12.0"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    },
+    "android": {
+      "debugApplicationIdSuffix": ".debug"
+    }
+  }
+}

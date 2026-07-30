@@ -1,7 +1,6 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
-import App from "./App";
-import "./styles.css";
+import App from "#daymark-surface";
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
@@ -9,7 +8,11 @@ createRoot(document.getElementById("root")!).render(
   </StrictMode>,
 );
 
-if ("serviceWorker" in navigator && import.meta.env.PROD) {
+if (
+  import.meta.env.VITE_DAYMARK_SURFACE !== "software" &&
+  "serviceWorker" in navigator &&
+  import.meta.env.PROD
+) {
   window.addEventListener("load", () => {
     navigator.serviceWorker
       .register(`${import.meta.env.BASE_URL}service-worker.js`, {

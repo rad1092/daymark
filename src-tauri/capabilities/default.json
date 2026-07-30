@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-window",
+  "description": "Daymark의 번들된 주 창에만 필요한 최소 권한.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}
