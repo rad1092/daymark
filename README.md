@@ -1,3 +1,8 @@
+> **개발 종료 · 2026-09-05**
+> Daymark의 독립 제품 개발을 종료했습니다. 원본 자료는 삭제하지 않습니다.
+> [자료 회수](https://daymark.whago.net/) · [구버전 열기](https://daymark.whago.net/legacy/)
+> 아래 문서는 보존된 구버전의 문서입니다. 웹 종료 배포는 `npm run build:retired`, 원래 앱 빌드는 기존 명령을 사용합니다.
+
 # Daymark
 
 Daymark는 오늘 끝낼 약속을 세 개까지 정하고, 일이 중단됐을 때 다음
