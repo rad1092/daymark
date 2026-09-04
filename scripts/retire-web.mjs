@@ -18,7 +18,7 @@ await cp(resolve(root, "retirement"), dist, { recursive: true });
 // A retained network-first shell serves the retirement page offline after first load.
 const worker = `const CACHE = "Daymark-archive-20260905";
 const STATIC_DESTINATIONS = new Set(["script", "style", "font", "image", "manifest"]);
-self.addEventListener("install", event => event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(["/", "/legacy/", "/data-move.js", "/data-move.css"])).then(() => self.skipWaiting())));
+self.addEventListener("install", event => event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(["/", "/legacy/", "/data-move.js", "/data-move.css", "/register-retirement.js"])).then(() => self.skipWaiting())));
 self.addEventListener("activate", event => event.waitUntil(self.clients.claim()));
 self.addEventListener("fetch", event => {
   const request = event.request;

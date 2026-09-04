@@ -23,8 +23,8 @@
     "mobile:ios:init": "tauri ios init",
     "mobile:ios:dev": "tauri ios dev",
     "mobile:ios:build": "tauri ios build",
-    "test": "vitest run",
-    "test:watch": "vitest",
+    "test": "vitest run --exclude scripts/retire-web.test.mjs",
+    "test:watch": "vitest --exclude scripts/retire-web.test.mjs",
     "lint": "eslint . --max-warnings 0 && tsc -b --pretty false",
     "build:retired": "npm run demo:build && node scripts/retire-web.mjs",
     "test:retirement": "node --test scripts/retire-web.test.mjs"

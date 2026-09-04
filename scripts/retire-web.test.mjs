@@ -66,3 +66,20 @@ async function verifyOfflineLegacy(worker, original) {
  assert.equal(await request("/api/private-data", "cors", ""), undefined, "API data is never intercepted or cached");
  assert.equal(await request("/assets/legacy.js", "cors", "script", "POST"), undefined);
 }
+
+
+test("retirement registration works with same-origin script-only CSP", async () => {
+ const html = await readFile(new URL("../retirement/index.html", import.meta.url), "utf8");
+ assert.match(html, /<script src="\/register-retirement\.js" defer><\/script>/);
+ assert.doesNotMatch(html, /<script\b(?![^>]*\bsrc=)[^>]*>/);
+ const script = await readFile(new URL("../retirement/register-retirement.js", import.meta.url), "utf8");
+ const calls = [];
+ let onLoad;
+ runInNewContext(script, {
+  window: { addEventListener(event, callback) { assert.equal(event, "load"); onLoad = callback; } },
+  navigator: { serviceWorker: { register(path, options) { calls.push([path, options.scope]); return Promise.resolve(); } } },
+ });
+ assert.equal(calls.length, 0);
+ onLoad();
+ assert.deepEqual(calls, [["/service-worker.js", "/"]]);
+});
