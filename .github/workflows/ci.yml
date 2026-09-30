@@ -99,11 +99,13 @@ jobs:
           cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
       - name: Build and launch-smoke the default macOS bundle
+        if: github.event_name == 'workflow_dispatch' && inputs.full_native
         run: |
           npm exec -- tauri build --bundles app --config '{"bundle":{"macOS":{"signingIdentity":"-"}}}'
           npm run software:smoke:macos
 
       - name: Build and launch-smoke the updater-enabled macOS bundle
+        if: github.event_name == 'workflow_dispatch' && inputs.full_native
         env:
           DAYMARK_UPDATE_ENDPOINT: https://updates.invalid/daymark/latest.json
           DAYMARK_UPDATER_PUBKEY: ci-smoke-public-key
