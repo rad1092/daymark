@@ -38,4 +38,8 @@ updates:
       rust-dependencies:
         patterns:
           - "*"
+    # Tauri's GTK 3 stack requires glib 0.18; the fix requires glib >=0.20.
+    # Remove this exception once the upstream stack supports a fixed release.
+    ignore:
+      - dependency-name: glib
     open-pull-requests-limit: 5
